@@ -784,14 +784,44 @@ static void _send_msg(struct block_device *block)
 			log_info("Pattern %s not supported by controller on %s. Overwrite by %s.",
 				 ibpi2str(block->ibpi), block->sysfs_path,
 				 ibpi2str(LED_IBPI_PATTERN_NORMAL));
-			block->ibpi = LED_IBPI_PATTERN_NORMAL;
-			status = block->send_message_fn(block, block->ibpi);
+			status = block->send_message_fn(block, LED_IBPI_PATTERN_NORMAL);
+			if (status == STATUS_INVALID_STATE)
+				status = STATUS_SUCCESS;
+			break;
+		/**
+		 * FAILED_ARRAY, PFA, and LOCATE_AND_FAIL have no direct VMD/AHCI
+		 * attention state. Remap to the closest supported pattern so the
+		 * amber LED lights on controllers that do not natively support them.
+		 *
+		 * Pass the remapped pattern directly to send_message_fn without
+		 * mutating block->ibpi. This keeps ibpi_prev pointing at the
+		 * original unsupported pattern after the retry, so the controller
+		 * dedup guard (ibpi == ibpi_prev) suppresses the first call on all
+		 * subsequent scans without re-triggering the remap log.
+		 */
+		case LED_IBPI_PATTERN_FAILED_ARRAY:
+		case LED_IBPI_PATTERN_PFA:
+		case LED_IBPI_PATTERN_LOCATE_AND_FAIL:
+			log_info("Pattern %s not supported by controller on %s. Overwrite by %s.",
+				 ibpi2str(block->ibpi), block->sysfs_path,
+				 ibpi2str(LED_IBPI_PATTERN_FAILED_DRIVE));
+			status = block->send_message_fn(block, LED_IBPI_PATTERN_FAILED_DRIVE);
+			if (status == STATUS_INVALID_STATE)
+				status = STATUS_SUCCESS;
 			break;
 		case LED_IBPI_PATTERN_ADDED:
 		case LED_IBPI_PATTERN_REMOVED:
 			log_info("Inappropiate IBPI LED status to set: %s on %s",
 				    ibpi2str(block->ibpi), block->sysfs_path);
+			status = STATUS_SUCCESS;
+			break;
 		default:
+			/*
+			 * Unknown pattern, permanently unsupported by this
+			 * controller. Treat as success so ibpi_prev is updated
+			 * and the dedup guard suppresses retries.
+			 */
+			status = STATUS_SUCCESS;
 			break;
 		}
 	}
@@ -801,6 +831,14 @@ static void _send_msg(struct block_device *block)
 	} else {
 		log_error("Unable to set %s IBPI state on %s. Status: %d",
 			  ibpi2str(block->ibpi), block->sysfs_path, status);
+		/*
+		 * For write errors (not STATUS_INVALID_STATE, which is handled
+		 * exhaustively in the switch above), advance ibpi_prev so the
+		 * dedup guard suppresses repeated hardware calls on subsequent
+		 * scan cycles. The state will be re-sent when ibpi next changes.
+		 */
+		if (status != STATUS_INVALID_STATE)
+			block->ibpi_prev = block->ibpi;
 	}
 }
 
